@@ -6,7 +6,7 @@ export async function POST(request: Request) {
   }
 
   // Detect URL type
-  if (scholarUrl.includes('scholar.google.com') || scholarUrl.includes('scholar.google.co')) {
+  if (scholarUrl.includes('scholar.google.')) {
     return handleGoogleScholar(scholarUrl);
   }
   if (scholarUrl.includes('semanticscholar.org')) {
@@ -19,82 +19,152 @@ export async function POST(request: Request) {
   );
 }
 
-// ── Google Scholar via SerpAPI ──────────────────────────────────
+// ── Google Scholar (direct fetch + parse) ───────────────────────
 
 async function handleGoogleScholar(url: string) {
-  // Extract user ID: scholar.google.com/citations?user=XXXX
   const match = url.match(/[?&]user=([^&]+)/);
   if (!match) {
     return Response.json(
-      { error: 'Could not parse Google Scholar URL. Expected format: https://scholar.google.com/citations?user=XXXX' },
+      { error: 'Could not parse Google Scholar URL. Expected: https://scholar.google.com/citations?user=XXXX' },
       { status: 400 },
     );
   }
 
   const userId = match[1];
-  const serpApiKey = process.env.SERPAPI_KEY;
-  if (!serpApiKey) {
-    return Response.json(
-      { error: 'Google Scholar import is not configured. Please add SERPAPI_KEY to .env.local (free at serpapi.com).' },
-      { status: 500 },
-    );
-  }
 
   try {
-    // Fetch author profile
-    const profileRes = await fetch(
-      `https://serpapi.com/search.json?engine=google_scholar_author&author_id=${userId}&api_key=${serpApiKey}`,
-    );
-    if (!profileRes.ok) {
-      return Response.json({ error: 'Could not find Google Scholar profile' }, { status: 404 });
-    }
-    const profileData = await profileRes.json();
-    const authorName = profileData.author?.name ?? 'Unknown';
-    const citationCount = profileData.cited_by?.table?.[0]?.citations?.all ?? 0;
+    const allPapers: Array<{
+      title: string;
+      authors: string[];
+      venue: string | null;
+      year: number | null;
+      paper_url: string | null;
+      pdf_url: string | null;
+      code_url: string | null;
+      semantic_scholar_paper_id: string | null;
+      citation_count: number;
+    }> = [];
 
-    // Fetch articles (SerpAPI paginates, fetch first 100)
-    const articles: Array<Record<string, unknown>> = [];
+    let authorName = '';
+    let totalCitations = 0;
     let start = 0;
-    while (start < 100) {
-      const articlesRes = await fetch(
-        `https://serpapi.com/search.json?engine=google_scholar_author&author_id=${userId}&start=${start}&num=100&api_key=${serpApiKey}`,
-      );
-      if (!articlesRes.ok) break;
-      const data = await articlesRes.json();
-      const batch = data.articles ?? [];
-      if (batch.length === 0) break;
-      articles.push(...batch);
-      start += batch.length;
-      if (batch.length < 100) break;
+
+    while (start < 500) {
+      const pageUrl = `https://scholar.google.com/citations?user=${userId}&cstart=${start}&pagesize=100&sortby=pubdate&hl=en`;
+      const res = await fetch(pageUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+      });
+
+      if (!res.ok) {
+        if (allPapers.length > 0) break;
+        return Response.json({ error: 'Could not fetch Google Scholar profile. Please try again.' }, { status: 502 });
+      }
+
+      const html = await res.text();
+
+      // Extract author name (first page only)
+      if (start === 0) {
+        const nameMatch = html.match(/id="gsc_prf_in"[^>]*>([^<]+)/);
+        authorName = nameMatch ? decode(nameMatch[1]) : 'Unknown';
+
+        const citMatch = html.match(/gsc_rsb_std">(\d+)</);
+        totalCitations = citMatch ? parseInt(citMatch[1], 10) : 0;
+      }
+
+      // Parse papers: extract all title links, then pair with gray divs and year/cite cells
+      const titles: { title: string; url: string | null }[] = [];
+      const titleRegex = /class="gsc_a_at"[^>]*(?:href="([^"]*)")?[^>]*>([^<]+)/g;
+      let m;
+      while ((m = titleRegex.exec(html)) !== null) {
+        const href = m[1] ? `https://scholar.google.com${decode(m[1])}` : null;
+        titles.push({ title: decode(m[2].trim()), url: href });
+      }
+
+      // Extract all gs_gray divs (authors and venue alternate)
+      const grayTexts: string[] = [];
+      const grayRegex = /class="gs_gray">([^<]+)/g;
+      while ((m = grayRegex.exec(html)) !== null) {
+        grayTexts.push(decode(m[1].trim()));
+      }
+
+      // Extract year spans
+      const years: (number | null)[] = [];
+      const yearRegex = /class="gsc_a_h gsc_a_hc gs_ibl">(\d{4})</g;
+      // Also match empty year cells
+      const yearCellRegex = /class="gsc_a_hc gs_ibl">([\d]*)</g;
+      while ((m = yearRegex.exec(html)) !== null) {
+        years.push(parseInt(m[1], 10));
+      }
+      // If year regex found nothing, try the cell regex
+      if (years.length === 0) {
+        while ((m = yearCellRegex.exec(html)) !== null) {
+          years.push(m[1] ? parseInt(m[1], 10) : null);
+        }
+      }
+
+      // Extract citation counts
+      const cites: number[] = [];
+      const citeRegex = /class="gsc_a_ac gs_ibl"[^>]*>(\d*)</g;
+      while ((m = citeRegex.exec(html)) !== null) {
+        cites.push(m[1] ? parseInt(m[1], 10) : 0);
+      }
+
+      if (titles.length === 0) break;
+
+      for (let i = 0; i < titles.length; i++) {
+        // gs_gray divs come in pairs: authors, then venue
+        const authorsText = grayTexts[i * 2] ?? '';
+        const venueText = grayTexts[i * 2 + 1] ?? '';
+
+        allPapers.push({
+          title: titles[i].title,
+          authors: authorsText ? authorsText.split(',').map(s => s.trim()).filter(Boolean) : [],
+          venue: venueText || null,
+          year: years[i] ?? null,
+          paper_url: titles[i].url,
+          pdf_url: null,
+          code_url: null,
+          semantic_scholar_paper_id: null,
+          citation_count: cites[i] ?? 0,
+        });
+      }
+
+      start += 100;
+
+      // Stop if fewer results than page size or no next button
+      if (titles.length < 100 || !html.includes('gsc_pgn_pnx')) break;
     }
 
-    const papers = articles.map((a) => ({
-      title: (a.title as string) || '',
-      authors: typeof a.authors === 'string'
-        ? (a.authors as string).split(',').map((s: string) => s.trim())
-        : [],
-      venue: (a.publication as string) || null,
-      year: typeof a.year === 'string' ? parseInt(a.year as string, 10) || null
-        : typeof a.year === 'number' ? (a.year as number) : null,
-      paper_url: (a.link as string) || null,
-      pdf_url: null,
-      code_url: null,
-      semantic_scholar_paper_id: null,
-      citation_count: typeof a.cited_by === 'object' && a.cited_by !== null
-        ? ((a.cited_by as { value?: number }).value ?? 0)
-        : 0,
-    }));
+    if (allPapers.length === 0) {
+      return Response.json({ error: 'No publications found on this Google Scholar profile.' }, { status: 404 });
+    }
 
     return Response.json({
       authorName,
       authorId: userId,
-      paperCount: papers.length,
-      citationCount,
-      papers,
+      paperCount: allPapers.length,
+      citationCount: totalCitations,
+      papers: allPapers,
     });
   } catch {
-    return Response.json({ error: 'Failed to connect to Google Scholar API' }, { status: 502 });
+    return Response.json({ error: 'Failed to fetch Google Scholar profile. Please try again.' }, { status: 502 });
   }
+}
+
+function decode(text: string): string {
+  return text
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&hellip;/g, '...')
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)));
 }
 
 // ── Semantic Scholar ────────────────────────────────────────────
@@ -103,7 +173,7 @@ async function handleSemanticScholar(url: string) {
   const match = url.match(/semanticscholar\.org\/author\/[^/]+\/(\d+)/);
   if (!match) {
     return Response.json(
-      { error: 'Could not parse Semantic Scholar URL. Expected format: https://www.semanticscholar.org/author/Name/1234567' },
+      { error: 'Could not parse Semantic Scholar URL. Expected: https://www.semanticscholar.org/author/Name/1234567' },
       { status: 400 },
     );
   }
