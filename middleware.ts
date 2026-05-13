@@ -1,4 +1,8 @@
-import { NextResponse, type NextRequest } from 'next/server';
+// Import NextResponse from the specific module to avoid the next/server barrel
+// export which eagerly loads ua-parser-js (uses __dirname → crashes Edge Runtime).
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import { NextResponse } from 'next/dist/server/web/spec-extension/response';
+import type { NextRequest } from 'next/server';
 
 /**
  * Subdomain routing middleware
